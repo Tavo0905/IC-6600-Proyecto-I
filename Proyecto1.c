@@ -4,6 +4,17 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <sys/msg.h>
+#include <unistd.h>
+#include <sys/wait.h>
+
+#define MSGSZ 2048
+#define MAX_PATH_SIZE 1024
+
+struct msg_buffer {
+    long msg_type;
+    char msg_text[MSGSZ];
+};
 
 void copy_file(const char *src, const char *dst) {
     FILE *source = fopen(src, "r");
@@ -30,43 +41,24 @@ void copy_file(const char *src, const char *dst) {
     fclose(dest);
 }
 
-void copy_directory(const char *src_dir, const char *dst_dir) {
-    DIR *dir;
-    struct dirent *dp;
-    struct stat st;
-    char src_path[512], dst_path[512];
+void worker(int msqid) {
+    struct msg_buffer message;
+    char src_path[MAX_PATH_SIZE], dst_path[MAX_PATH_SIZE];
 
-    if ((dir = opendir(src_dir)) == NULL) {
-        perror("Error opening source directory");
-        exit(EXIT_FAILURE);
+    while (1) {
+        if (msgrcv(msqid, &message, MSGSZ, 1, 0) == -1) {
+            perror("msgrcv");
+            exit(EXIT_FAILURE);
+        }
+
+        if (strcmp(message.msg_text, "DONE") == 0) {
+            break;
+        }
+
+        sscanf(message.msg_text, "%s %s", src_path, dst_path);
+
+        copy_file(src_path, dst_path);
     }
-
-    while ((dp = readdir(dir)) != NULL) {
-        if (strcmp(dp->d_name, ".") == 0 || strcmp(dp->d_name, "..") == 0) {
-            continue;
-        }
-
-        snprintf(src_path, sizeof(src_path), "%s/%s", src_dir, dp->d_name);
-        snprintf(dst_path, sizeof(dst_path), "%s/%s", dst_dir, dp->d_name);
-
-        if (stat(src_path, &st) == -1) {
-            perror("Error getting file status");
-            continue;
-        }
-
-        if (S_ISDIR(st.st_mode)) {
-            // Es un directorio
-            if (mkdir(dst_path, st.st_mode) == -1) {
-                perror("Error creating directory");
-            }
-            copy_directory(src_path, dst_path);
-        } else {
-            // Es un archivo
-            copy_file(src_path, dst_path);
-        }
-    }
-
-    closedir(dir);
 }
 
 int main(int argc, char *argv[]) {
@@ -78,7 +70,69 @@ int main(int argc, char *argv[]) {
     char *src_dir = argv[1];
     char *dst_dir = argv[2];
 
-    copy_directory(src_dir, dst_dir);
+    DIR *dir;
+    struct dirent *dp;
+    struct msg_buffer message;
+    int msqid;
+
+    key_t key = ftok("msgq", 65);
+    msqid = msgget(key, 0666 | IPC_CREAT);
+
+    int pid;
+    int num_workers = 4;  // Número de procesos en el pool
+
+    for (int i = 0; i < num_workers; i++) {
+        pid = fork();
+        if (pid == 0) {
+            worker(msqid);
+            exit(EXIT_SUCCESS);
+        }
+    }
+
+    if ((dir = opendir(src_dir)) == NULL) {
+        perror("Error opening source directory");
+        exit(EXIT_FAILURE);
+    }
+
+    char src_path[MAX_PATH_SIZE], dst_path[MAX_PATH_SIZE];
+
+    while ((dp = readdir(dir)) != NULL) {
+        if (strcmp(dp->d_name, ".") == 0 || strcmp(dp->d_name, "..") == 0) {
+            continue;
+        }
+
+        snprintf(src_path, sizeof(src_path), "%s/%s", src_dir, dp->d_name);
+        snprintf(dst_path, sizeof(dst_path), "%s/%s", dst_dir, dp->d_name);
+
+        snprintf(message.msg_text, sizeof(message.msg_text), "%s %s", src_path, dst_path);
+        message.msg_type = 1;
+
+        if (msgsnd(msqid, &message, strlen(message.msg_text) + 1, 0) == -1) {
+            perror("msgsnd");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    closedir(dir);
+
+    // Enviar mensajes de terminación a los trabajadores
+    for (int i = 0; i < num_workers; i++) {
+        snprintf(message.msg_text, sizeof(message.msg_text), "DONE");
+        message.msg_type = 1;
+
+        if (msgsnd(msqid, &message, strlen(message.msg_text) + 1, 0) == -1) {
+            perror("msgsnd");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    // Esperar a que todos los procesos hijos terminen
+    for (int i = 0; i < num_workers; i++) {
+        wait(NULL);
+    }
+
+    // Eliminar la cola de mensajes
+    msgctl(msqid, IPC_RMID, NULL);
 
     printf("Directory copied successfully!\n");
 
