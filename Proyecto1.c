@@ -7,6 +7,7 @@
 #include <sys/msg.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <time.h>
 
 #define MSGSZ 2048
 #define MAX_PATH_SIZE 1024
@@ -18,13 +19,13 @@ struct msg_buffer {
 
 void copy_file(const char *src, const char *dst) {
     FILE *source = fopen(src, "r");
-    if (source == NULL) {
+    if (source == NULL) { // En caso de no existir el archivo
         perror("Error opening source file");
         exit(EXIT_FAILURE);
     }
 
     FILE *dest = fopen(dst, "w");
-    if (dest == NULL) {
+    if (dest == NULL) { // En caso de no encontrar el destino
         perror("Error opening destination file");
         fclose(source);
         exit(EXIT_FAILURE);
@@ -34,6 +35,7 @@ void copy_file(const char *src, const char *dst) {
     size_t bytes;
 
     while ((bytes = fread(buffer, 1, BUFSIZ, source)) > 0) {
+        // Copia el archivo al destino
         fwrite(buffer, 1, bytes, dest);
     }
 
@@ -41,7 +43,51 @@ void copy_file(const char *src, const char *dst) {
     fclose(dest);
 }
 
+void copy_directory(const char *src, const char *dst) {
+    DIR *dir;
+    struct dirent *dp;
+
+    if ((dir = opendir(src)) == NULL) { // En caso de no encontrar el directorio
+        perror("Error opening source directory");
+        exit(EXIT_FAILURE);
+    }
+
+    char src_path[MAX_PATH_SIZE], dst_path[MAX_PATH_SIZE];
+
+    while ((dp = readdir(dir)) != NULL) {
+
+        // Evitamos reprocesar el directorio actual y el anterior
+        if (strcmp(dp->d_name, ".") == 0 || strcmp(dp->d_name, "..") == 0) {
+            continue;
+        }
+
+        snprintf(src_path, sizeof(src_path), "%s/%s", src, dp->d_name);
+        snprintf(dst_path, sizeof(dst_path), "%s/%s", dst, dp->d_name);
+
+        struct stat statbuf;
+        stat(src_path, &statbuf);
+
+        if (S_ISDIR(statbuf.st_mode)) {
+            // Si encuentra otro directorio lo vuelve a copiar
+            if (mkdir(dst_path, 0777) == -1) {
+                perror("Error creating destination directory");
+                exit(EXIT_FAILURE);
+            }
+            printf("Copying directory: %s, Size: %ld bytes\n", src_path, statbuf.st_size);
+            copy_directory(src_path, dst_path);
+        } else {
+            // Si encuentra un archivo lo copia
+            printf("Copying file: %s, Size: %ld bytes\n", src_path, statbuf.st_size);
+            copy_file(src_path, dst_path);
+        }
+    }
+
+    closedir(dir);
+}
+
 void worker(int msqid) {
+
+    // Para cada uno de los procesos hijos
     struct msg_buffer message;
     char src_path[MAX_PATH_SIZE], dst_path[MAX_PATH_SIZE];
 
@@ -57,7 +103,21 @@ void worker(int msqid) {
 
         sscanf(message.msg_text, "%s %s", src_path, dst_path);
 
-        copy_file(src_path, dst_path);
+        struct stat statbuf;
+        stat(src_path, &statbuf);
+        
+        // Valida si es un dir o un file, y luego realiza la copia
+        if (S_ISDIR(statbuf.st_mode)) {
+            if (mkdir(dst_path, 0777) == -1) {
+                perror("Error creating destination directory");
+                exit(EXIT_FAILURE);
+            }
+            printf("Copying directory: %s, Size: %ld bytes\n", src_path, statbuf.st_size);
+            copy_directory(src_path, dst_path);
+        } else {
+            printf("Copying file: %s, Size: %ld bytes\n", src_path, statbuf.st_size);
+            copy_file(src_path, dst_path);
+        }
     }
 }
 
@@ -67,6 +127,9 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
+    clock_t start, end;
+
+    // Se extraen los directorios objetivo y destino
     char *src_dir = argv[1];
     char *dst_dir = argv[2];
 
@@ -79,7 +142,11 @@ int main(int argc, char *argv[]) {
     msqid = msgget(key, 0666 | IPC_CREAT);
 
     int pid;
-    int num_workers = 4;  // Número de procesos en el pool
+    int num_workers = 4;
+
+    start = clock(); // Toma el tiempo inicial para sacar el total
+
+    printf("\n");
 
     for (int i = 0; i < num_workers; i++) {
         pid = fork();
@@ -115,7 +182,6 @@ int main(int argc, char *argv[]) {
 
     closedir(dir);
 
-    // Enviar mensajes de terminación a los trabajadores
     for (int i = 0; i < num_workers; i++) {
         snprintf(message.msg_text, sizeof(message.msg_text), "DONE");
         message.msg_type = 1;
@@ -126,15 +192,19 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Esperar a que todos los procesos hijos terminen
     for (int i = 0; i < num_workers; i++) {
         wait(NULL);
     }
 
-    // Eliminar la cola de mensajes
+    // Se calcula la diferencia de tiempos
+    end = clock();
+    double cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
+
     msgctl(msqid, IPC_RMID, NULL);
 
-    printf("Directory copied successfully!\n");
+    printf("Directory copied successfully!\n\n");
+
+    printf("Time taken to copy file/directory: %f seconds\n", cpu_time_used);
 
     return 0;
 }
