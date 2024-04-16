@@ -17,7 +17,12 @@ struct msg_buffer {
     char msg_text[MSGSZ];
 };
 
-void copy_file(const char *src, const char *dst) {
+void copy_file(const char *src, const char *dst, FILE *logfile, int thread_id) {
+
+    clock_t startP, endP;
+
+    startP = clock();
+
     FILE *source = fopen(src, "r");
     if (source == NULL) { // En caso de no existir el archivo
         perror("Error opening source file");
@@ -41,9 +46,13 @@ void copy_file(const char *src, const char *dst) {
 
     fclose(source);
     fclose(dest);
+
+    endP = clock();
+    // Registrar en el archivo de bitácora
+    fprintf(logfile, "%s,%d,%f\n", src, thread_id, (double) (endP - startP) / CLOCKS_PER_SEC);
 }
 
-void copy_directory(const char *src, const char *dst) {
+void copy_directory(const char *src, const char *dst, FILE *logfile, int thread_id) {
     DIR *dir;
     struct dirent *dp;
 
@@ -74,18 +83,18 @@ void copy_directory(const char *src, const char *dst) {
                 exit(EXIT_FAILURE);
             }
             printf("Copying directory: %s, Size: %ld bytes\n", src_path, statbuf.st_size);
-            copy_directory(src_path, dst_path);
+            copy_directory(src_path, dst_path, logfile, thread_id);
         } else {
             // Si encuentra un archivo lo copia
             printf("Copying file: %s, Size: %ld bytes\n", src_path, statbuf.st_size);
-            copy_file(src_path, dst_path);
+            copy_file(src_path, dst_path, logfile, thread_id);
         }
     }
 
     closedir(dir);
 }
 
-void worker(int msqid) {
+void worker(int msqid, FILE *logfile, int thread_id) {
 
     // Para cada uno de los procesos hijos
     struct msg_buffer message;
@@ -113,10 +122,10 @@ void worker(int msqid) {
                 exit(EXIT_FAILURE);
             }
             printf("Copying directory: %s, Size: %ld bytes\n", src_path, statbuf.st_size);
-            copy_directory(src_path, dst_path);
+            copy_directory(src_path, dst_path, logfile, thread_id);
         } else {
             printf("Copying file: %s, Size: %ld bytes\n", src_path, statbuf.st_size);
-            copy_file(src_path, dst_path);
+            copy_file(src_path, dst_path, logfile, thread_id);
         }
     }
 }
@@ -128,6 +137,16 @@ int main(int argc, char *argv[]) {
     }
 
     clock_t start, end;
+
+    // Apertura del archivo de bitácora
+    FILE *logfile = fopen("logfile.csv", "w");
+    if (logfile == NULL) {
+        perror("Error opening logfile");
+        exit(EXIT_FAILURE);
+    } else {
+        fprintf(logfile, "File,Thread,Time\n");
+    }
+
 
     // Se extraen los directorios objetivo y destino
     char *src_dir = argv[1];
@@ -151,7 +170,7 @@ int main(int argc, char *argv[]) {
     for (int i = 0; i < num_workers; i++) {
         pid = fork();
         if (pid == 0) {
-            worker(msqid);
+            worker(msqid, logfile, i);
             exit(EXIT_SUCCESS);
         }
     }
@@ -205,6 +224,8 @@ int main(int argc, char *argv[]) {
     printf("Directory copied successfully!\n\n");
 
     printf("Time taken to copy file/directory: %f seconds\n", cpu_time_used);
+
+    fclose(logfile);
 
     return 0;
 }
